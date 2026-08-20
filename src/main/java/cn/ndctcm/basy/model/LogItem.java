@@ -134,13 +134,6 @@ public class LogItem {
         this.jkdbErrorCount = jkdbErrorCount;
     }
 
-    /**
-     * 分析是否完成: isAnalysis=1 表示完成
-     */
-    public boolean isAnalysisComplete() {
-        return "1".equals(isAnalysis);
-    }
-
     @Override
     public String toString() {
         return "LogItem{logId='" + logId + "', oldFileName='" + oldFileName

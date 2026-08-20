@@ -21,16 +21,19 @@ import java.util.stream.Collectors;
 /**
  * 批量上传编排服务
  *
- * 执行流程（针对每个文件）:
+ * 执行流程:
+ * 0. 运行开始时先确认 uploaded 目录中上次遗留的文件（使用与步骤 3/4/5 相同的匹配与判定规则）:
+ *    满足成功条件迁入 success 目录；不满足成功条件放回原上传目录等待重新上传
+ * 针对每个待上传文件:
  * 1. 调用接口 1 uploadFile 上传文件
  * 2. 上传解析成功后将文件迁移至同级 uploaded 目录（介于待上传与成功之间的中间状态）
- * 3. 轮询接口 2 logList，按 fileName 与 oldFileName 匹配（同名取最近一条）并等待分析完成
- * 4. logList 查询到该文件且 isSucceed=1 后，将文件从 uploaded 迁移至同级 success 目录
- * 5. 若接口 2 返回 errorCount > 0 且有 logId，调用接口 3 getFileErrorLog 下载异常日志到 errorLogs 目录
+ * 3. 轮询接口 2 logList，按 oldFileName 匹配（同名取 uploadDate 最新一条），匹配到记录即返回
+ * 4. 匹配记录满足 totalCount>0 且 errorCount=0 时视为成功，将文件从 uploaded 迁移至同级 success 目录
+ * 5. 匹配记录不满足成功条件（totalCount=0 或 errorCount>0）时视为失败：errorCount>0 且有 logId 时
+ *    调用接口 3 getFileErrorLog 下载异常日志到 errorLogs 目录，文件从 uploaded 放回原上传目录等待重新上传
  * 6. 上传阶段因网络问题（连接超时/被拒绝、SSL 握手失败等）导致接口调不通时，文件保留在待上传目录，
  *    不迁入 fail；仅当平台明确返回上传失败时才迁入 fail
- * 7. uploaded 目录中的文件仅在 logList 明确返回失败（分析完成且 isSucceed≠1）时迁入同级 fail 目录；
- *    logList 接口调不通或轮询超时（未获得明确结果）时文件保留在 uploaded 目录，不做迁移
+ * 7. logList 接口调不通或轮询超时（未匹配到记录）时文件保留在 uploaded 目录，不做迁移
  */
 public class BatchUploadService {
 
@@ -49,6 +52,9 @@ public class BatchUploadService {
      * 执行批量上传
      */
     public void execute() {
+        // 0. 确认 uploaded 目录中上次运行遗留的文件（成功迁入 success，不满足成功条件放回待上传目录重新上传）
+        reconfirmUploadedFiles();
+
         // 1. 扫描待上传文件
         List<File> files = scanFiles();
         if (files.isEmpty()) {
@@ -108,7 +114,7 @@ public class BatchUploadService {
         System.out.println("待确认(保留在 uploaded 目录): " + pendingCount);
         System.out.println("网络问题跳过(保留在待上传目录): " + skipCount);
         if (failCount > 0) {
-            System.out.println("请检查上方日志了解失败原因");
+            System.out.println("请检查上方日志了解失败原因，失败文件已保留在待上传目录，下次运行将重新上传");
         }
         if (pendingCount > 0) {
             System.out.println("待确认文件已保留在 uploaded 目录，logList 接口恢复后可重新确认");
@@ -116,6 +122,44 @@ public class BatchUploadService {
         if (skipCount > 0) {
             System.out.println("因网络问题未上传的文件已保留在待上传目录，网络恢复后重新运行即可再次上传");
         }
+    }
+
+    /**
+     * 确认 uploaded 目录中上次运行遗留的文件
+     * 使用与步骤2相同的匹配与判定规则（pollLogList 按 oldFileName 匹配，同名取 uploadDate 最新一条）:
+     * - 满足成功条件(totalCount>0 且 errorCount=0) → 迁入 success 目录
+     * - 不满足成功条件 → 下载异常日志后放回原上传目录，等待重新上传
+     * - 未匹配到记录(轮询超时)或 logList 接口调不通 → 保留在 uploaded 目录待下次确认
+     */
+    private void reconfirmUploadedFiles() {
+        List<File> uploadedFiles = scanUploadedDir();
+        if (uploadedFiles.isEmpty()) {
+            return;
+        }
+
+        System.out.println("========== 确认 uploaded 目录遗留文件: " + uploadedFiles.size() + " 个 ==========\n");
+        int successCount = 0;
+        int failCount = 0;
+        int pendingCount = 0;
+        for (File file : uploadedFiles) {
+            System.out.println("---------- " + file.getName() + " ----------");
+            ProcessResult result = confirmUploadedFile(file);
+            switch (result) {
+                case SUCCESS:
+                    successCount++;
+                    break;
+                case FAIL:
+                    failCount++;
+                    break;
+                default:
+                    pendingCount++;
+                    break;
+            }
+            System.out.println();
+        }
+        System.out.println("uploaded 目录确认完成: 成功 " + successCount
+                + " 个，放回待上传 " + failCount + " 个，待确认 " + pendingCount + " 个");
+        System.out.println();
     }
 
     /**
@@ -326,10 +370,11 @@ public class BatchUploadService {
     }
 
     /**
-     * 处理单个文件: 上传 -> 迁移至 uploaded 中间目录 -> logList 确认后迁移至 success 目录 -> 下载异常日志
+     * 处理单个文件: 上传 -> 迁移至 uploaded 中间目录 -> logList 匹配后按 totalCount/errorCount 判定迁移
      * 上传阶段因网络问题导致接口调不通时，文件保留在待上传目录，不迁入 fail；
-     * uploaded 目录中的文件仅在 logList 明确返回失败（分析完成且 isSucceed≠1）时迁入 fail 目录；
-     * logList 接口调不通或轮询超时（未获得明确结果）时文件保留在 uploaded 目录，不做迁移
+     * logList 匹配到记录（oldFileName 相同、取 uploadDate 最新一条）后，totalCount>0 且 errorCount=0
+     * 视为成功迁入 success 目录，否则下载异常日志后从 uploaded 放回原上传目录等待重新上传；
+     * logList 接口调不通或轮询超时（未匹配到记录）时文件保留在 uploaded 目录，不做迁移
      */
     private ProcessResult processFile(File file) throws Exception {
         // ---- 步骤1: 上传文件 (接口1) ----
@@ -358,11 +403,25 @@ public class BatchUploadService {
         // ---- 上传解析成功: 先迁移至 uploaded 中间目录（介于待上传与成功之间），等待 logList 确认 ----
         File uploadedFile = moveToUploadedDir(file);
 
-        // ---- 步骤 2: 查询日志列表 (接口 2) ----
+        // ---- 步骤 2: 查询日志列表并按 totalCount/errorCount 判定 (接口 2) ----
         System.out.println("[步骤2] 查询日志列表...");
+        ProcessResult confirmResult = confirmUploadedFile(uploadedFile);
+        if (confirmResult == ProcessResult.SUCCESS) {
+            System.out.println("\n  🎉 本批次处理完成！\n");
+        }
+        return confirmResult;
+    }
+
+    /**
+     * 对位于 uploaded 目录中的文件进行 logList 确认，并按判定结果迁移:
+     * - 满足成功条件(totalCount>0 且 errorCount=0) → 迁入同级 success 目录
+     * - 不满足成功条件(totalCount=0 或 errorCount>0) → 下载异常日志后放回原上传目录，等待重新上传
+     * - 未匹配到记录(轮询超时)或 logList 接口调不通 → 保留在 uploaded 目录，不做迁移
+     */
+    private ProcessResult confirmUploadedFile(File uploadedFile) {
         LogItem logItem;
         try {
-            logItem = pollLogList(file.getName());
+            logItem = pollLogList(uploadedFile.getName());
         } catch (Exception e) {
             // logList 接口调不通，未获得明确结果：文件保留在 uploaded 目录，不做迁移
             System.err.println("  查询日志列表出错(logList 接口调不通): " + e.getMessage());
@@ -371,7 +430,7 @@ public class BatchUploadService {
             return ProcessResult.PENDING;
         }
         if (logItem == null) {
-            // 轮询超时，logList 未明确返回失败：文件保留在 uploaded 目录，不做迁移
+            // 轮询超时未匹配到记录：文件保留在 uploaded 目录，不做迁移
             System.err.println("  未在日志列表中找到该文件的记录（轮询超时）");
             System.err.println("  ⏸ 文件保留在 uploaded 目录，待下次确认: "
                     + uploadedFile.getAbsolutePath());
@@ -379,43 +438,50 @@ public class BatchUploadService {
         }
         System.out.println("  找到日志记录:");
         System.out.println("    logId:      " + logItem.getLogId());
+        System.out.println("    uploadDate: " + logItem.getUploadDate());
         System.out.println("    isAnalysis: " + logItem.getIsAnalysis());
         System.out.println("    isSucceed:  " + logItem.getIsSucceed());
         System.out.println("    errorCount: " + logItem.getErrorCount());
         System.out.println("    totalCount: " + logItem.getTotalCount());
 
-        // 判断是否真正成功（isSucceed = '1'）
-        if (!"1".equals(logItem.getIsSucceed())) {
-            // logList 明确返回上传失败：迁入 fail 目录
-            System.err.println("  ❗ logList 明确返回上传失败 (isSucceed=" + logItem.getIsSucceed() + ")");
-            moveToFailDir(uploadedFile);
-            return ProcessResult.FAIL;
+        // 判定规则: 匹配到记录后，totalCount>0 且 errorCount=0 视为成功
+        if (logItem.getTotalCount() > 0 && logItem.getErrorCount() == 0) {
+            System.out.println("  ✅ 文件处理成功！\n");
+            // logList 查询确认成功后，将文件从 uploaded 迁移至同级 success 目录
+            moveToSuccessDir(uploadedFile);
+            return ProcessResult.SUCCESS;
         }
 
-        System.out.println("  ✅ 文件处理成功！\n");
+        // 不满足成功条件（totalCount=0 或 errorCount>0）：下载异常日志后放回原上传目录等待重新上传
+        System.err.println("  ❗ 判定失败: totalCount=" + logItem.getTotalCount()
+                + ", errorCount=" + logItem.getErrorCount() + "（成功需 totalCount>0 且 errorCount=0）");
 
-        // logList 查询确认成功后，将文件从 uploaded 迁移至同级 success 目录
-        moveToSuccessDir(uploadedFile);
-        
-        // ---- 步骤 3: 下载异常日志 (接口 3) ----
+        // ---- 下载异常日志 (接口 3)，失败记录保留错误明细供排查 ----
         if (logItem.getErrorCount() > 0 && logItem.getLogId() != null
                 && !logItem.getLogId().isEmpty()) {
-            System.out.println("[步骤 3] 下载异常日志...");
-            String errorLog = client.getFileErrorLog(logItem.getLogId());
-            Path errorLogDir = getErrorLogDir();
-            ensureDir(errorLogDir.toString());
-            String savePath = saveErrorLog(file.getName(), errorLog, errorLogDir);
-            System.out.println("  异常日志已保存至：" + savePath);
-            // 打印前200字符预览
-            String preview = errorLog.length() > 200
-                    ? errorLog.substring(0, 200) + "..." : errorLog;
-            System.out.println("  日志预览: " + preview);
-        } else {
-            System.out.println("[步骤 3] 无异常日志需要下载 (errorCount=0)");
+            System.out.println("  下载异常日志...");
+            try {
+                String errorLog = getFileErrorLogWithRetry(logItem.getLogId());
+                if (errorLog == null || errorLog.trim().isEmpty()) {
+                    System.out.println("  服务端未返回该记录的详细失败日志内容");
+                } else {
+                    Path errorLogDir = getErrorLogDir();
+                    ensureDir(errorLogDir.toString());
+                    String savePath = saveErrorLog(uploadedFile.getName(), errorLog, errorLogDir);
+                    System.out.println("  异常日志已保存至：" + savePath);
+                    // 打印前200字符预览
+                    String preview = errorLog.length() > 200
+                            ? errorLog.substring(0, 200) + "..." : errorLog;
+                    System.out.println("  日志预览: " + preview);
+                }
+            } catch (IOException e) {
+                // 异常日志下载失败不影响失败判定结果
+                System.err.println("  下载异常日志出错: " + e.getMessage());
+            }
         }
-        
-        System.out.println("\n  🎉 本批次处理完成！\n");
-        return ProcessResult.SUCCESS;
+
+        moveBackToUploadDir(uploadedFile);
+        return ProcessResult.FAIL;
     }
 
     /**
@@ -441,11 +507,11 @@ public class BatchUploadService {
     }
 
     /**
-     * 轮询 logList，直到找到匹配文件名且分析完成的记录
+     * 轮询 logList，直到匹配到文件名对应的记录
      * 同名文件存在多条时，取 uploadDate 最新的一条
      *
      * @param fileName 上传的文件名
-     * @return 匹配的 LogItem（分析完成即为终态，isSucceed 由调用方判定），超时返回 null
+     * @return 匹配到的 LogItem（由调用方按 totalCount/errorCount 判定成败），超时未匹配到返回 null
      */
     private LogItem pollLogList(String fileName) throws IOException, InterruptedException {
         int interval = config.getLogPollIntervalSeconds();
@@ -466,20 +532,15 @@ public class BatchUploadService {
                 continue;
             }
 
-            // 在结果中查找匹配的文件名，同名文件取最近一条
+            // 在结果中查找匹配的文件名，同名文件取 uploadDate 最新一条；匹配到即返回，由调用方按 totalCount/errorCount 判定
             LogItem latestMatch = findLatestMatch(result.getRows(), fileName);
             if (latestMatch == null) {
                 System.out.println("  第 " + pollCount + " 次轮询：未找到匹配记录，等待...");
                 continue;
             }
-            if (latestMatch.isAnalysisComplete()) {
-                // 分析完成后 isSucceed 即为最终结果（1=成功，其他=明确失败），直接返回交由调用方判定
-                System.out.println("  第 " + pollCount + " 次轮询：文件分析已完成 (isSucceed="
-                        + latestMatch.getIsSucceed() + ")");
-                return latestMatch;
-            } else {
-                System.out.println("  第 " + pollCount + " 次轮询：文件分析中，等待...");
-            }
+            System.out.println("  第 " + pollCount + " 次轮询：已匹配到记录 (uploadDate="
+                    + latestMatch.getUploadDate() + ")");
+            return latestMatch;
         }
 
         return null;
@@ -551,10 +612,23 @@ public class BatchUploadService {
     }
 
     /**
-     * 扫描配置目录下匹配扩展名的文件
+     * 扫描待上传目录下匹配扩展名的文件
      */
     private List<File> scanFiles() {
-        File dir = new File(config.getUploadFileDir());
+        return scanDir(new File(config.getUploadFileDir()));
+    }
+
+    /**
+     * 扫描 uploaded 目录下待确认的遗留文件
+     */
+    private List<File> scanUploadedDir() {
+        return scanDir(getSiblingDir("uploaded"));
+    }
+
+    /**
+     * 扫描指定目录下匹配扩展名的文件
+     */
+    private List<File> scanDir(File dir) {
         if (!dir.exists() || !dir.isDirectory()) {
             return new ArrayList<>();
         }
@@ -596,7 +670,14 @@ public class BatchUploadService {
     }
 
     /**
-     * 上传或确认失败后，将文件迁移至上传目录的同级 fail 目录
+     * logList 判定不满足成功条件后，将文件从 uploaded 目录放回原上传目录，等待重新上传
+     */
+    private void moveBackToUploadDir(File file) {
+        moveFileTo(file, new File(config.getUploadFileDir()), "待上传");
+    }
+
+    /**
+     * 上传失败后，将文件迁移至上传目录的同级 fail 目录
      */
     private void moveToFailDir(File file) {
         //moveFileTo(file, getSiblingDir("fail"), "fail");
@@ -657,7 +738,7 @@ public class BatchUploadService {
     private enum ProcessResult {
         /** logList 确认成功，已迁入 success 目录 */
         SUCCESS,
-        /** 平台明确返回上传失败或 logList 明确返回失败，已迁入 fail 目录 */
+        /** 平台明确返回上传失败或 logList 判定不满足成功条件，文件留在/放回待上传目录等待重新上传 */
         FAIL,
         /** logList 接口调不通或轮询超时，文件保留在 uploaded 目录待确认 */
         PENDING,
