@@ -82,7 +82,7 @@ public class Main {
         System.out.println("  文件目录:   " + new java.io.File(config.getUploadFileDir()).getAbsolutePath());
         System.out.println("  文件类型:   " + config.getUploadFileExtension());
         System.out.println("  超时(秒):   " + config.getTimeoutSeconds());
-        System.out.println("  重试次数:   " + config.getRetryCount());
+        System.out.println("  重试次数:   " + (config.getRetryCount() < 0 ? "无限(-1)" : config.getRetryCount()));
         System.out.println("  轮询间隔:   " + config.getLogPollIntervalSeconds() + "s");
         System.out.println("  轮询超时:   " + config.getLogPollTimeoutSeconds() + "s");
         System.out.println("  日志目录:   " + new java.io.File(config.getDownloadErrorLogDir()).getAbsolutePath());

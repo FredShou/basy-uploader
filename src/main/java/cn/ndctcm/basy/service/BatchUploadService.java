@@ -15,7 +15,9 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -24,10 +26,15 @@ import java.util.stream.Collectors;
  * 执行流程:
  * 0. 运行开始时先确认 uploaded 目录中上次遗留的文件（使用与步骤 3/4/5 相同的匹配与判定规则）:
  *    满足成功条件迁入 success 目录；不满足成功条件放回原上传目录等待重新上传
+ *
+ * 并行任务: 启动时同步开启预检线程 ProcessedFilePrechecker，循环调用接口 2 logList 匹配
+ * 待上传目录中的文件，平台已有成功记录(totalCount>0 且 errorCount=0)的直接移入 success 目录
+ * 跳过上传；上传循环结束后停止预检线程
  * 针对每个待上传文件:
  * 1. 调用接口 1 uploadFile 上传文件
  * 2. 上传解析成功后将文件迁移至同级 uploaded 目录（介于待上传与成功之间的中间状态）
- * 3. 轮询接口 2 logList，按 oldFileName 匹配（同名取 uploadDate 最新一条），匹配到记录即返回
+ * 3. 轮询接口 2 logList，按 oldFileName 匹配（成功优先：存在任意一条成功记录即成功，
+ *    同名后续重复上传的失败记录不影响判定；无成功记录时取最新一条判定），匹配到记录即返回
  * 4. 匹配记录满足 totalCount>0 且 errorCount=0 时视为成功，将文件从 uploaded 迁移至同级 success 目录
  * 5. 匹配记录不满足成功条件（totalCount=0 或 errorCount>0）时视为失败：errorCount>0 且有 logId 时
  *    调用接口 3 getFileErrorLog 下载异常日志到 errorLogs 目录，文件从 uploaded 放回原上传目录等待重新上传
@@ -39,6 +46,11 @@ public class BatchUploadService {
 
     private final AppConfig config;
     private final BasyApiClient client;
+
+    /** 与预检线程共享的协调锁（检查+移动/登记 均在锁内完成） */
+    private final Object fileCoordLock = new Object();
+    /** 正在上传中的文件名集合：主线程上传前登记、finally 移除，预检线程据此跳过 */
+    private final Set<String> uploadingNames = new HashSet<>();
 
     /** 直接查询失败日志时的分页大小（全量遍历场景下减少请求次数） */
     private static final int FAILED_QUERY_PAGE_SIZE = 50;
@@ -52,81 +64,134 @@ public class BatchUploadService {
      * 执行批量上传
      */
     public void execute() {
-        // 0. 确认 uploaded 目录中上次运行遗留的文件（成功迁入 success，不满足成功条件放回待上传目录重新上传）
-        reconfirmUploadedFiles();
+        // 预检线程：与上传并行，循环调用 logList，
+        // 将平台已成功处理的待上传文件直接移入 success 目录，跳过上传
+        ProcessedFilePrechecker prechecker = new ProcessedFilePrechecker(
+                config, client, fileCoordLock, uploadingNames);
+        prechecker.start();
+        try {
+            // 0. 确认 uploaded 目录中上次运行遗留的文件（成功迁入 success，不满足成功条件放回待上传目录重新上传）
+            reconfirmUploadedFiles();
 
-        // 1. 扫描待上传文件
-        List<File> files = scanFiles();
-        if (files.isEmpty()) {
-            System.out.println("未找到待上传文件");
-            System.out.println("请将文件放置在目录: " + new File(config.getUploadFileDir()).getAbsolutePath());
-            System.out.println("文件扩展名: " + config.getUploadFileExtension());
-            return;
-        }
+            // 1. 扫描待上传文件
+            List<File> files = scanFiles();
+            if (files.isEmpty()) {
+                System.out.println("未找到待上传文件");
+                System.out.println("请将文件放置在目录: " + new File(config.getUploadFileDir()).getAbsolutePath());
+                System.out.println("文件扩展名: " + config.getUploadFileExtension());
+                return;
+            }
 
-        System.out.println("共找到 " + files.size() + " 个待上传文件:\n");
-        for (int i = 0; i < files.size(); i++) {
-            System.out.println("  [" + (i + 1) + "] " + files.get(i).getName()
-                    + " (" + formatSize(files.get(i).length()) + ")");
-        }
-        System.out.println();
-
-        // 2. 确保输出目录存在
-        ensureDir(config.getDownloadErrorLogDir());
-
-        // 3. 逐个上传
-        int successCount = 0;
-        int failCount = 0;
-        int pendingCount = 0;
-        int skipCount = 0;
-        for (int i = 0; i < files.size(); i++) {
-            File file = files.get(i);
-            System.out.println("========== [" + (i + 1) + "/" + files.size() + "] "
-                    + file.getName() + " ==========");
-            try {
-                ProcessResult result = processFile(file);
-                switch (result) {
-                    case SUCCESS:
-                        successCount++;
-                        break;
-                    case FAIL:
-                        failCount++;
-                        break;
-                    case SKIPPED:
-                        skipCount++;
-                        break;
-                    default:
-                        pendingCount++;
-                        break;
-                }
-            } catch (Exception e) {
-                failCount++;
-                System.err.println("处理文件 " + file.getName() + " 时出错: " + e.getMessage());
+            System.out.println("共找到 " + files.size() + " 个待上传文件:\n");
+            for (int i = 0; i < files.size(); i++) {
+                System.out.println("  [" + (i + 1) + "] " + files.get(i).getName()
+                        + " (" + formatSize(files.get(i).length()) + ")");
             }
             System.out.println();
-        }
 
-        // 4. 汇总
-        System.out.println("========== 批量上传完成 ==========");
-        System.out.println("总计: " + files.size() + " 个文件");
-        System.out.println("成功: " + successCount);
-        System.out.println("失败: " + failCount);
-        System.out.println("待确认(保留在 uploaded 目录): " + pendingCount);
-        System.out.println("网络问题跳过(保留在待上传目录): " + skipCount);
-        if (failCount > 0) {
-            System.out.println("请检查上方日志了解失败原因，失败文件已保留在待上传目录，下次运行将重新上传");
+            // 2. 确保输出目录存在
+            ensureDir(config.getDownloadErrorLogDir());
+
+            // 3. 逐个上传
+            int successCount = 0;
+            int failCount = 0;
+            int pendingCount = 0;
+            int skipCount = 0;
+            for (int i = 0; i < files.size(); i++) {
+                File file = files.get(i);
+                System.out.println("========== [" + (i + 1) + "/" + files.size() + "] "
+                        + file.getName() + " ==========");
+                // 上传前协调：预检线程可能已将该文件直接移入 success 目录
+                if (!claimForUpload(file)) {
+                    System.out.println("  已被预检线程移入 success 目录（平台已有成功记录），跳过上传");
+                    System.out.println();
+                    continue;
+                }
+                try {
+                    ProcessResult result = processFile(file);
+                    switch (result) {
+                        case SUCCESS:
+                            successCount++;
+                            break;
+                        case FAIL:
+                            failCount++;
+                            break;
+                        case SKIPPED:
+                            skipCount++;
+                            break;
+                        default:
+                            pendingCount++;
+                            break;
+                    }
+                } catch (Exception e) {
+                    failCount++;
+                    System.err.println("处理文件 " + file.getName() + " 时出错: " + e.getMessage());
+                } finally {
+                    synchronized (fileCoordLock) {
+                        uploadingNames.remove(file.getName());
+                    }
+                }
+                System.out.println();
+            }
+
+            // 4. 上传循环结束后先停止预检线程，再输出汇总（保证计数终值与可见性）
+            stopPrechecker(prechecker);
+
+            // 5. 汇总
+            System.out.println("========== 批量上传完成 ==========");
+            System.out.println("总计: " + files.size() + " 个文件");
+            System.out.println("成功: " + successCount);
+            System.out.println("失败: " + failCount);
+            System.out.println("待确认(保留在 uploaded 目录): " + pendingCount);
+            System.out.println("网络问题跳过(保留在待上传目录): " + skipCount);
+            int precheckMovedCount = prechecker.getMovedCount();
+            if (precheckMovedCount > 0) {
+                System.out.println("平台已处理直接成功: " + precheckMovedCount
+                        + " 个（由预检线程直接移入 success，未重复上传）");
+            }
+            if (failCount > 0) {
+                System.out.println("请检查上方日志了解失败原因，失败文件已保留在待上传目录，下次运行将重新上传");
+            }
+            if (pendingCount > 0) {
+                System.out.println("待确认文件已保留在 uploaded 目录，logList 接口恢复后可重新确认");
+            }
+            if (skipCount > 0) {
+                System.out.println("因网络问题未上传的文件已保留在待上传目录，网络恢复后重新运行即可再次上传");
+            }
+        } finally {
+            // 兜底停止（含"未找到待上传文件"提前返回路径；shutdown 幂等）
+            stopPrechecker(prechecker);
         }
-        if (pendingCount > 0) {
-            System.out.println("待确认文件已保留在 uploaded 目录，logList 接口恢复后可重新确认");
+    }
+
+    /**
+     * 上传前在协调锁内登记文件：若已被预检线程移入 success（文件不存在）返回 false 跳过上传；
+     * 否则登记进 uploadingNames（预检线程据此跳过该文件），由调用方在 finally 中移除
+     */
+    private boolean claimForUpload(File file) {
+        synchronized (fileCoordLock) {
+            if (!file.exists()) {
+                return false;
+            }
+            uploadingNames.add(file.getName());
+            return true;
         }
-        if (skipCount > 0) {
-            System.out.println("因网络问题未上传的文件已保留在待上传目录，网络恢复后重新运行即可再次上传");
+    }
+
+    /**
+     * 停止预检线程（幂等）：置停止标志、打断休眠并等待退出
+     */
+    private static void stopPrechecker(ProcessedFilePrechecker prechecker) {
+        try {
+            prechecker.shutdown();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
     /**
      * 确认 uploaded 目录中上次运行遗留的文件
-     * 使用与步骤2相同的匹配与判定规则（pollLogList 按 oldFileName 匹配，同名取 uploadDate 最新一条）:
+     * 使用与步骤2相同的匹配与判定规则（pollLogList 成功优先匹配：任意一条成功记录即成功）:
      * - 满足成功条件(totalCount>0 且 errorCount=0) → 迁入 success 目录
      * - 不满足成功条件 → 下载异常日志后放回原上传目录，等待重新上传
      * - 未匹配到记录(轮询超时)或 logList 接口调不通 → 保留在 uploaded 目录待下次确认
@@ -277,7 +342,8 @@ public class BatchUploadService {
      * @param limit 每页条数
      */
     private LogListResult logListWithRetry(int page, int limit) throws IOException {
-        int maxAttempts = config.getRetryCount() + 1;
+        // retryCount=-1 表示无限重试
+        int maxAttempts = config.getRetryCount() < 0 ? Integer.MAX_VALUE : config.getRetryCount() + 1;
         IOException lastError = null;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -311,7 +377,8 @@ public class BatchUploadService {
      * @param logId 日志 ID
      */
     private String getFileErrorLogWithRetry(String logId) throws IOException {
-        int maxAttempts = config.getRetryCount() + 1;
+        // retryCount=-1 表示无限重试
+        int maxAttempts = config.getRetryCount() < 0 ? Integer.MAX_VALUE : config.getRetryCount() + 1;
         IOException lastError = null;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -372,8 +439,8 @@ public class BatchUploadService {
     /**
      * 处理单个文件: 上传 -> 迁移至 uploaded 中间目录 -> logList 匹配后按 totalCount/errorCount 判定迁移
      * 上传阶段因网络问题导致接口调不通时，文件保留在待上传目录，不迁入 fail；
-     * logList 匹配到记录（oldFileName 相同、取 uploadDate 最新一条）后，totalCount>0 且 errorCount=0
-     * 视为成功迁入 success 目录，否则下载异常日志后从 uploaded 放回原上传目录等待重新上传；
+     * logList 匹配到记录（oldFileName 相同，成功优先：任意一条成功记录即成功）后
+     * 迁入 success 目录，否则下载异常日志后从 uploaded 放回原上传目录等待重新上传；
      * logList 接口调不通或轮询超时（未匹配到记录）时文件保留在 uploaded 目录，不做迁移
      */
     private ProcessResult processFile(File file) throws Exception {
@@ -486,14 +553,17 @@ public class BatchUploadService {
 
     /**
      * 带重试的上传
+     * retryCount=-1 时无限重试当前文件，直至上传成功（每轮上传失败后等待 3 秒）
      */
     private UploadResult uploadWithRetry(File file) throws IOException, InterruptedException {
-        int maxAttempts = config.getRetryCount() + 1;
+        boolean infinite = config.getRetryCount() < 0;
+        int maxAttempts = infinite ? Integer.MAX_VALUE : config.getRetryCount() + 1;
         IOException lastError = null;
 
         for (int attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                System.out.println("  上传中 (第 " + attempt + "/" + maxAttempts + " 次)...");
+                System.out.println("  上传中 (第 " + attempt
+                        + (infinite ? " 次，无限重试直至成功" : "/" + maxAttempts + " 次") + ")...");
                 return client.uploadFile(file, config.getOrgCode());
             } catch (IOException e) {
                 lastError = e;
@@ -507,11 +577,13 @@ public class BatchUploadService {
     }
 
     /**
-     * 轮询 logList，直到匹配到文件名对应的记录
-     * 同名文件存在多条时，取 uploadDate 最新的一条
+     * 轮询 logList，直到匹配到文件名对应的记录（成功优先）
+     * 成功优先规则：存在任意一条成功记录（totalCount>0 且 errorCount=0）即返回该成功记录，
+     * 同名后续重复上传产生的失败记录不影响成功判定；
+     * 无成功记录时返回 uploadDate 最新的一条（同名多条），由调用方按 totalCount/errorCount 判定
      *
      * @param fileName 上传的文件名
-     * @return 匹配到的 LogItem（由调用方按 totalCount/errorCount 判定成败），超时未匹配到返回 null
+     * @return 匹配到的 LogItem，超时未匹配到返回 null
      */
     private LogItem pollLogList(String fileName) throws IOException, InterruptedException {
         int interval = config.getLogPollIntervalSeconds();
@@ -532,7 +604,15 @@ public class BatchUploadService {
                 continue;
             }
 
-            // 在结果中查找匹配的文件名，同名文件取 uploadDate 最新一条；匹配到即返回，由调用方按 totalCount/errorCount 判定
+            // 成功优先：只要存在任意一条成功记录（totalCount>0 且 errorCount=0）即视为成功，
+            // 同名后续重复上传产生的失败记录不影响判定（不再仅看最新一条）
+            LogItem successMatch = findSuccessMatch(result.getRows(), fileName);
+            if (successMatch != null) {
+                System.out.println("  第 " + pollCount + " 次轮询：已匹配到成功记录 (uploadDate="
+                        + successMatch.getUploadDate() + ")");
+                return successMatch;
+            }
+            // 无成功记录：按最新一条返回，由调用方判定（匹配到即判定，不等待后续分析结果）
             LogItem latestMatch = findLatestMatch(result.getRows(), fileName);
             if (latestMatch == null) {
                 System.out.println("  第 " + pollCount + " 次轮询：未找到匹配记录，等待...");
@@ -549,12 +629,13 @@ public class BatchUploadService {
     /**
      * 在日志列表中查找与文件名匹配的最近一条记录
      * 同名文件存在多条时，取 uploadDate 最新的一条
+     * 包级静态方法：主流程轮询确认与 ProcessedFilePrechecker 预检共用同一份判定逻辑
      *
      * @param rows     日志列表
      * @param fileName 上传的文件名
      * @return 匹配的 LogItem，无匹配返回 null
      */
-    private LogItem findLatestMatch(List<LogItem> rows, String fileName) {
+    static LogItem findLatestMatch(List<LogItem> rows, String fileName) {
         LogItem latest = null;
         for (LogItem item : rows) {
             if (fileName.equals(item.getOldFileName())) {
@@ -567,11 +648,31 @@ public class BatchUploadService {
     }
 
     /**
+     * 在日志列表中查找该文件名的成功记录（totalCount>0 且 errorCount=0，任意一条即命中）
+     * 平台只要曾成功处理过该文件即视为已上传成功（用户规则：有一次上传成功即成功，
+     * 不再仅看最新一条），同名文件后续重复上传产生的失败记录不影响判定；
+     * 预检线程与步骤2确认流程共用
+     *
+     * @param rows     日志列表
+     * @param fileName 上传的文件名
+     * @return 命中的成功记录，无成功记录返回 null
+     */
+    static LogItem findSuccessMatch(List<LogItem> rows, String fileName) {
+        for (LogItem item : rows) {
+            if (fileName.equals(item.getOldFileName())
+                    && item.getTotalCount() > 0 && item.getErrorCount() == 0) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    /**
      * 比较两个 LogItem 的 uploadDate 时间先后
      *
      * @return >0 表示 item1 更晚，<0 表示 item2 更晚，0 表示相同
      */
-    private int compareUploadDate(LogItem item1, LogItem item2) {
+    static int compareUploadDate(LogItem item1, LogItem item2) {
         String date1 = item1.getUploadDate();
         String date2 = item2.getUploadDate();
         if (date1 == null && date2 == null) return 0;
@@ -627,6 +728,7 @@ public class BatchUploadService {
 
     /**
      * 扫描指定目录下匹配扩展名的文件
+     * 按文件名末尾的 年_月_编号 数值从小到大排序，确保按编号从小到大依次上传
      */
     private List<File> scanDir(File dir) {
         if (!dir.exists() || !dir.isDirectory()) {
@@ -650,8 +752,79 @@ public class BatchUploadService {
                     }
                     return false;
                 })
-                .sorted()
+                .sorted(this::compareByTrailingNumbers)
                 .collect(Collectors.toList());
+    }
+
+    /**
+     * 按文件名末尾数字段（年、月、文件编号）数值比较两个文件的先后
+     * 文件名形如 TCMMS61003_高邮县中医院__2025_05_11.zip，末尾数字段依次为年、月、编号；
+     * 逐段按数值比较（编号 2 排在编号 10 之前，字典序会颠倒两者），
+     * 末尾无数字段的文件排在最后，之间按名称字典序
+     */
+    private int compareByTrailingNumbers(File f1, File f2) {
+        String name1 = f1.getName();
+        String name2 = f2.getName();
+        long[] nums1 = extractTrailingNumbers(name1);
+        long[] nums2 = extractTrailingNumbers(name2);
+        if (nums1 == null && nums2 == null) {
+            return name1.compareTo(name2);
+        }
+        if (nums1 == null) {
+            return 1;
+        }
+        if (nums2 == null) {
+            return -1;
+        }
+        int len = Math.min(nums1.length, nums2.length);
+        for (int i = 0; i < len; i++) {
+            int cmp = Long.compare(nums1[i], nums2[i]);
+            if (cmp != 0) {
+                return cmp;
+            }
+        }
+        return Integer.compare(nums1.length, nums2.length);
+    }
+
+    /**
+     * 提取文件名末尾按 _ 分隔的连续数字段
+     * 如 TCMMS61003_高邮县中医院__2025_05_11.zip 提取出 [2025, 5, 11]（年、月、编号）；
+     * 前缀中的数字（如机构编码 61003）不在末尾连续数字段中，不会被误取
+     *
+     * @return 末尾数字段数组，末尾无数字段时返回 null
+     */
+    private long[] extractTrailingNumbers(String fileName) {
+        int dotIdx = fileName.lastIndexOf('.');
+        String baseName = dotIdx > 0 ? fileName.substring(0, dotIdx) : fileName;
+        String[] tokens = baseName.split("_");
+        int end = tokens.length;
+        while (end > 0 && isNumberToken(tokens[end - 1])) {
+            end--;
+        }
+        if (end == tokens.length) {
+            return null;
+        }
+        long[] numbers = new long[tokens.length - end];
+        for (int i = 0; i < numbers.length; i++) {
+            numbers[i] = Long.parseLong(tokens[end + i]);
+        }
+        return numbers;
+    }
+
+    /**
+     * 判断分隔段是否为可解析的纯数字段（仅 ASCII 数字，限 18 位以内避免超出 long 范围）
+     */
+    private boolean isNumberToken(String token) {
+        if (token.isEmpty() || token.length() > 18) {
+            return false;
+        }
+        for (int i = 0; i < token.length(); i++) {
+            char c = token.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
